@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - '*.md'
+      - '*.txt'
+      - 'LICENSE'
+  pull_request:
+    branches:
+      - dev
+    paths-ignore:
+      - '*.md'
+      - '*.txt'
+      - 'LICENSE'
+  workflow_dispatch:
+
+jobs:
+  compile-skse:
+    name: Compile SKSE (SexLabUtil)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set xmake env
+        run: echo "XMAKE_GLOBALDIR=${{ runner.workspace }}/xmake-global" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Create xmake cache directories
+        run: |
+          mkdir -p "${{ env.XMAKE_GLOBALDIR }}/xmake-cache"
+          mkdir -p "${{ env.XMAKE_GLOBALDIR }}/build-cache"
+        shell: bash
+
+      - name: Cache xmake dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xmake/packages
+            ${{ env.XMAKE_GLOBALDIR }}/xmake-cache
+          key: xmake-deps-${{ runner.os }}-${{ hashFiles('xmake-requires.lock') }}
+          restore-keys: |
+            xmake-deps-${{ runner.os }}-
+
+      - name: Cache xmake build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.XMAKE_GLOBALDIR }}/build-cache
+          key: xmake-build-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            xmake-build-${{ runner.os }}-
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: 'latest'
+          actions-cache-folder: ${{ env.XMAKE_GLOBALDIR }}/xmake-cache
+          actions-cache-key: '.xmake-actions-cache'
+          build-cache: true
+          build-cache-path: ${{ env.XMAKE_GLOBALDIR }}/build-cache
+          build-cache-key: xmake-build-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Configure
+        run: |
+          xmake repo --update
+          xmake f -y -m release --build_papyrus=n --build_spriggit=n --build_assets=n
+          xmake require -y
+
+      - name: Build SexLabUtil
+        run: xmake build SexLabUtil
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $dll = "build/windows/x64/release/SexLabUtil.dll"
+          if (-not (Test-Path $dll)) { throw "Missing $dll" }
+          Get-Item $dll | Format-List Name, Length, LastWriteTime
+
+  compile-spriggit:
+    name: Compile Spriggit (SexLab.esm)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Spriggit
+        id: cache-spriggit
+        uses: actions/cache@v4
+        with:
+          path: .github/spriggit
+          key: ${{ runner.os }}-spriggit-cli
+
+      - name: Fetch Spriggit
+        if: steps.cache-spriggit.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .github -Force | Out-Null
+          gh release download -R Mutagen-Modding/Spriggit --pattern "SpriggitCLI.zip" --dir .github --clobber
+          7z x .github/SpriggitCLI.zip "-o.github\spriggit" -y
+          if (-not (Test-Path ".github/spriggit/Spriggit.CLI.exe")) {
+            throw "Spriggit.CLI.exe not found after extraction"
+          }
+
+      - name: Deserialize SexLab.esm
+        shell: cmd
+        run: .github\spriggit\Spriggit.CLI.exe deserialize --InputPath "res/SexLab.esm" --OutputPath "dist/SexLab.esm"
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/SexLab.esm")) { throw "Missing dist/SexLab.esm" }
+          Get-Item "dist/SexLab.esm" | Format-List Name, Length, LastWriteTime
+
+  compile-papyrus:
+    name: Compile Papyrus
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Papyrus includes
+        id: cache-ss
+        uses: actions/cache@v4
+        with:
+          path: .github/Papyrus
+          key: papyrus-includes-v1
+
+      - name: Cache Caprica
+        id: cache-com
+        uses: actions/cache@v4
+        with:
+          path: .github/Caprica
+          key: caprica-0.3.0a
+
+      - name: Fetch Caprica
+        if: steps.cache-com.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .github -Force | Out-Null
+          gh release download 0.3.0a -R KrisV-777/Caprica --pattern "Caprica.zip" --dir .github --clobber
+          7z x .github/Caprica.zip "-o.github\Caprica" -y
+          if (-not (Test-Path ".github/Caprica/Caprica.exe")) {
+            throw "Caprica.exe not found after extraction"
+          }
+
+      - name: Stage Papyrus includes
+        if: steps.cache-ss.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: .github/scripts/setup-papyrus-includes.ps1
+
+      - name: Ensure VRIK stub present
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .github/Papyrus/SRC_VRIK -Force | Out-Null
+          Copy-Item .github/ci/papyrus-stubs/VRIK.psc .github/Papyrus/SRC_VRIK/VRIK.psc -Force
+
+      - name: Compile with Caprica
+        shell: pwsh
+        run: |
+          $imports = @(
+            ".github/Papyrus/SRC",
+            ".github/Papyrus/SRC_SKYUI",
+            ".github/Papyrus/SRC_PAPUTIL",
+            ".github/Papyrus/SRC_RACEMENU",
+            ".github/Papyrus/SRC_MFG",
+            ".github/Papyrus/SRC_LOVENSE",
+            ".github/Papyrus/SRC_VRIK",
+            "dist/Source/Scripts"
+          ) -join ";"
+          New-Item -ItemType Directory -Path "dist/Scripts" -Force | Out-Null
+          & .github/Caprica/Caprica.exe `
+            --game skyrim `
+            --import $imports `
+            --output "dist/Scripts" `
+            --flags=".github/Papyrus/SRC/TESV_Papyrus_Flags.flg" `
+            "dist/Source/Scripts" `
+            -R -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $pex = Get-ChildItem "dist/Scripts" -Filter "*.pex" -ErrorAction SilentlyContinue
+          if (-not $pex -or $pex.Count -eq 0) { throw "No .pex files produced" }
+          Write-Host "Compiled $($pex.Count) scripts"
